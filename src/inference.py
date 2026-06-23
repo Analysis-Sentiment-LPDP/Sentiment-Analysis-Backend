@@ -88,11 +88,60 @@ class SentimentPredictor:
     def predict_batch(self, texts: List[str]) -> pd.DataFrame:
         """Batch predicts a list of texts and returns a Pandas DataFrame."""
         logger.info(f"Batch predicting {len(texts)} texts...")
-        results = [self.predict(t) for t in texts]
         
-        # Flatten probabilities for clean DataFrame columns
+        classes = self.label_encoder.classes_
+        
+        # 1. Preprocess all texts
+        preprocessed_texts = []
+        valid_indices = []
+        results = [None] * len(texts)
+        
+        for idx, text in enumerate(texts):
+            if not isinstance(text, str) or not text.strip():
+                results[idx] = self._empty_result(text)
+                continue
+                
+            clean_text = self.preprocessor.filter_text(text)
+            lower_text = clean_text.lower()
+            normalized = self.preprocessor.normalize_words(lower_text)
+            no_stop = self.preprocessor.remove_stopwords(normalized)
+            stemmed = self.preprocessor.stem(no_stop)
+            
+            if not stemmed.strip():
+                results[idx] = self._empty_result(text)
+            else:
+                preprocessed_texts.append(stemmed)
+                valid_indices.append(idx)
+                
+        # 2. Vectorize and predict in batch if there are valid texts
+        if preprocessed_texts:
+            features = self.tfidf.transform(preprocessed_texts)
+            preds = self.model.predict(features)
+            probas = self.model.predict_proba(features)
+            pred_labels = self.label_encoder.inverse_transform(preds)
+            
+            for i, idx in enumerate(valid_indices):
+                pred_label = pred_labels[i]
+                pred_proba = probas[i]
+                
+                prob_detail = {
+                    str(cls): round(float(p), 4)
+                    for cls, p in zip(classes, pred_proba)
+                }
+                
+                results[idx] = {
+                    "text_original": texts[idx],
+                    "text_preprocessed": preprocessed_texts[i],
+                    "sentiment": str(pred_label),
+                    "confidence": round(float(pred_proba.max()), 4),
+                    "probabilities": prob_detail,
+                }
+                
+        # 3. Flatten probabilities for clean DataFrame columns
         flat_results = []
         for res in results:
+            if res is None:
+                continue
             row = {
                 "text_original": res["text_original"],
                 "text_preprocessed": res["text_preprocessed"],
