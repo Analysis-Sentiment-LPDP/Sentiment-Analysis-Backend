@@ -4,12 +4,14 @@ import logging
 from typing import Dict, Any, Union, List
 import joblib
 import pandas as pd
+import numpy as np
 
 # Add the project root directory to python path if executing as a script directly
 if __name__ == "__main__" and __package__ is None:
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.preprocessing import TextPreprocessor
+from src.lexicon import LexiconLabeler
 
 logger = logging.getLogger(__name__)
 
@@ -35,15 +37,16 @@ class SentimentPredictor:
         self.tfidf = joblib.load(tfidf_path)
         self.label_encoder = joblib.load(le_path)
         
-        # Initialize text preprocessor
+        # Initialize text preprocessor and lexicon labeler
         self.preprocessor = TextPreprocessor()
+        self.labeler = LexiconLabeler()
         logger.info("SentimentPredictor is ready.")
 
     def predict(self, text: str) -> Dict[str, Any]:
         """Predicts sentiment for a single input string.
         
         Process flow:
-        Raw Text -> Clean -> Case Fold -> Normalize -> Remove Stopwords -> Stem -> TF-IDF -> Predict
+        Raw Text -> Clean -> Case Fold -> Normalize -> Remove Stopwords -> Stem -> TF-IDF + Lexicon Blending -> Predict
         
         Note: Language filtering is disabled during inference to prevent dropping
         short queries.
@@ -62,26 +65,44 @@ class SentimentPredictor:
         if not stemmed.strip():
             return self._empty_result(text)
             
-        # Vectorize using loaded TF-IDF
-        features = self.tfidf.transform([stemmed])
-        
-        # Classify and get class probabilities
-        pred_idx = self.model.predict(features)[0]
-        pred_proba = self.model.predict_proba(features)[0]
-        
-        pred_label = self.label_encoder.inverse_transform([pred_idx])[0]
+        # 1. Calculate lexicon score and pseudo-probabilities
+        lex_score, _ = self.labeler.label_sentiment(stemmed)
         classes = self.label_encoder.classes_
+        class_to_idx = {cls: idx for idx, cls in enumerate(classes)}
+        
+        lex_proba = np.zeros(len(classes))
+        if lex_score > 0:
+            lex_proba[class_to_idx.get("Positif", 0)] = 0.85 if lex_score < 5 else 0.95
+            lex_proba[class_to_idx.get("Netral", 0)] = 0.10 if lex_score < 5 else 0.04
+            lex_proba[class_to_idx.get("Negatif", 0)] = 0.05 if lex_score < 5 else 0.01
+        elif lex_score < 0:
+            lex_proba[class_to_idx.get("Negatif", 0)] = 0.85 if lex_score > -5 else 0.95
+            lex_proba[class_to_idx.get("Netral", 0)] = 0.10 if lex_score > -5 else 0.04
+            lex_proba[class_to_idx.get("Positif", 0)] = 0.05 if lex_score > -5 else 0.01
+        else:
+            lex_proba[class_to_idx.get("Netral", 0)] = 0.80
+            lex_proba[class_to_idx.get("Positif", 0)] = 0.10
+            lex_proba[class_to_idx.get("Negatif", 0)] = 0.10
+            
+        # 2. Vectorize using loaded TF-IDF and get model probabilities
+        features = self.tfidf.transform([stemmed])
+        model_proba = self.model.predict_proba(features)[0]
+        
+        # 3. Blend model and lexicon probabilities
+        final_proba = 0.5 * model_proba + 0.5 * lex_proba
+        pred_idx = np.argmax(final_proba)
+        pred_label = classes[pred_idx]
         
         prob_detail = {
             str(cls): round(float(p), 4)
-            for cls, p in zip(classes, pred_proba)
+            for cls, p in zip(classes, final_proba)
         }
         
         return {
             "text_original": text,
             "text_preprocessed": stemmed,
             "sentiment": str(pred_label),
-            "confidence": round(float(pred_proba.max()), 4),
+            "confidence": round(float(final_proba.max()), 4),
             "probabilities": prob_detail,
         }
 
@@ -90,6 +111,7 @@ class SentimentPredictor:
         logger.info(f"Batch predicting {len(texts)} texts...")
         
         classes = self.label_encoder.classes_
+        class_to_idx = {cls: idx for idx, cls in enumerate(classes)}
         
         # 1. Preprocess all texts
         preprocessed_texts = []
@@ -116,24 +138,42 @@ class SentimentPredictor:
         # 2. Vectorize and predict in batch if there are valid texts
         if preprocessed_texts:
             features = self.tfidf.transform(preprocessed_texts)
-            preds = self.model.predict(features)
             probas = self.model.predict_proba(features)
-            pred_labels = self.label_encoder.inverse_transform(preds)
             
             for i, idx in enumerate(valid_indices):
-                pred_label = pred_labels[i]
-                pred_proba = probas[i]
+                stemmed = preprocessed_texts[i]
+                lex_score, _ = self.labeler.label_sentiment(stemmed)
+                
+                # Determine lexicon pseudo-probabilities
+                lex_proba = np.zeros(len(classes))
+                if lex_score > 0:
+                    lex_proba[class_to_idx.get("Positif", 0)] = 0.85 if lex_score < 5 else 0.95
+                    lex_proba[class_to_idx.get("Netral", 0)] = 0.10 if lex_score < 5 else 0.04
+                    lex_proba[class_to_idx.get("Negatif", 0)] = 0.05 if lex_score < 5 else 0.01
+                elif lex_score < 0:
+                    lex_proba[class_to_idx.get("Negatif", 0)] = 0.85 if lex_score > -5 else 0.95
+                    lex_proba[class_to_idx.get("Netral", 0)] = 0.10 if lex_score > -5 else 0.04
+                    lex_proba[class_to_idx.get("Positif", 0)] = 0.05 if lex_score > -5 else 0.01
+                else:
+                    lex_proba[class_to_idx.get("Netral", 0)] = 0.80
+                    lex_proba[class_to_idx.get("Positif", 0)] = 0.10
+                    lex_proba[class_to_idx.get("Negatif", 0)] = 0.10
+                    
+                model_proba = probas[i]
+                final_proba = 0.5 * model_proba + 0.5 * lex_proba
+                pred_idx = np.argmax(final_proba)
+                pred_label = classes[pred_idx]
                 
                 prob_detail = {
                     str(cls): round(float(p), 4)
-                    for cls, p in zip(classes, pred_proba)
+                    for cls, p in zip(classes, final_proba)
                 }
                 
                 results[idx] = {
                     "text_original": texts[idx],
-                    "text_preprocessed": preprocessed_texts[i],
+                    "text_preprocessed": stemmed,
                     "sentiment": str(pred_label),
-                    "confidence": round(float(pred_proba.max()), 4),
+                    "confidence": round(float(final_proba.max()), 4),
                     "probabilities": prob_detail,
                 }
                 
